@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# 本地环境/密钥（本项目当前不需要，但避免误传）
+.env
+.env.*
+!.env.example
+
+# WorkBuddy 项目数据（聊天/记忆，不应上传）
+.workbuddy/
+
+# 测试产物（截图、结果 JSON）
+tests/artifacts/
+
+# 历史备份文件
+jieqi - 副本.html
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log

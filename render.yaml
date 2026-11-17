@@ -1,0 +1,14 @@
+# Render Blueprint：免费 Web Service（本文件只描述配置，不会自动部署）
+# 创建方式：Render 控制台 New → Blueprint，选中本仓库；或手动 New → Web Service 按 README 填写。
+services:
+  - type: web
+    name: jieqi-online
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.2

@@ -1,0 +1,28 @@
+{
+  "name": "jieqi-online",
+  "version": "1.0.0",
+  "private": true,
+  "description": "揭棋：单机双人 / 人机 / 双人在线联机（本地 Node 服务）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test tests/engine.test.js tests/engine-contract.test.js tests/ai.test.js tests/mp.test.js tests/persist.test.js tests/persist-config.test.js tests/reap.test.js",
+    "test:persist": "node --test tests/persist.test.js tests/persist-config.test.js",
+    "test:ai": "node --test tests/ai.test.js",
+    "test:cloudbase": "node tests/cloudbase-integration.mjs",
+    "test:cloudbase:dry": "node tests/cloudbase-integration.mjs --dry-run",
+    "test:e2e": "node tests/e2e-online.mjs",
+    "test:flip": "node tests/e2e-flip.mjs",
+    "test:deploy": "node tests/e2e-deploy.mjs",
+    "test:ui": "node tests/e2e-ui.mjs",
+    "test:peek": "node tests/e2e-peek.mjs",
+    "test:room": "node tests/e2e-room.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@cloudbase/js-sdk": "^3.10.3",
+    "ws": "^8.22.0"
+  }
+}
