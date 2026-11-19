@@ -19,6 +19,7 @@
 |---|---|
 | 本地双人 | 同一台设备轮流走棋，无需服务端 |
 | 人机对战 | 内置 AI，四档难度（初级 / 普通 / 困难 / 大师） |
+| 大模型 AI | 由服务端调用 OpenAI 兼容接口选步，可选棋风；未配置时自动提示 |
 | 联机对战 | 房间号加入，服务端权威判定走子，支持断线重连 |
 | 观战 | 每个房间可设 3～5 个观战位，观战者与玩家看到的棋盘信息同等脱敏 |
 
@@ -29,6 +30,7 @@
 - **前端**：原生 HTML/CSS/JS 单文件（`jieqi.html`），规则引擎与 AI 搜索都在页面内，Web Worker 跑搜索。
 - **服务端**：Node.js（>= 18）+ [`ws`](https://github.com/websockets/ws)，原生 HTTP + WebSocket，无框架。
 - **持久化（可选）**：腾讯云 CloudBase 文档数据库（`roomRepository.js`），未配置时纯内存运行。
+- **大模型 AI（可选）**：`aiKnowledge.js` + `ai-knowledge/` 把棋理知识组合进 System Prompt，调用任意 OpenAI 兼容接口。
 - **部署**：`render.yaml` 为 Render 的 Blueprint 示例；任意能跑 Node 的平台均可。
 
 ## 快速开始
@@ -47,19 +49,40 @@ npm start
 
 ```
 jieqi.html                 单文件前端：界面 + 规则引擎 + AI 搜索
-server.js                  HTTP + WebSocket 服务端（房间、席位、权威走子校验）
+server.js                  HTTP + WebSocket 服务端（房间、席位、权威走子校验、大模型 AI 接口）
 roomRepository.js          CloudBase 持久化仓库（可选组件，未配置时只存内存）
+aiKnowledge.js             知识库读取与 System Prompt 组装
+ai-knowledge/              棋理知识（core 基础 / skills 按局面命中 / strategies 棋风）
 package.json / package-lock.json
 render.yaml                Render 部署示例
-tests/                     引擎、协议、持久化与浏览器端到端测试
+tests/                     引擎、协议、持久化、大模型与浏览器端到端测试
 ```
+
+## 大模型 AI（可选）
+
+`server.js` 启动时会读取同目录下的 `.env`（不存在则静默跳过；该文件已在 `.gitignore` 中）。把服务端的模型配置写进 `.env` 即可：
+
+| 环境变量 | 是否必需 | 说明 |
+|---|---|---|
+| `AI_API_TOKEN` | 是 | 模型服务的 API Key，只在服务端使用，不会下发给浏览器 |
+| `AI_MODEL` | 是 | 模型名，如 `gpt-4o-mini`、`deepseek-chat` 等 |
+| `AI_API_BASE` | 否 | OpenAI 兼容接口地址，默认 `https://api.openai.com/v1` |
+| `AI_TIMEOUT_MS` | 否 | 单次请求超时，默认 30000 |
+| `AI_MAX_ATTEMPTS` | 否 | 走法非法时的重试次数，默认 3 |
+| `AI_STRATEGY` | 否 | 棋风：`aggressive` / `balanced`（默认）/ `defensive` |
+
+配置后页面「模式」里选**大模型 AI** 即可；`GET /api/ai/status` 只返回是否已配置与模型名，不会返回 Token。
+
+发出去的棋盘是**脱敏视图**：未翻开的暗子只带棋位类型，不带真实颜色与兵种；模型返回的走法会逐条对照本地合法走法，非法则重试，多次失败则放弃该步。修改 `ai-knowledge/` 下的 Markdown 后可 `POST /api/ai/knowledge/reload` 热重载，无需重启。
 
 ## 测试
 
 ```bash
-npm test                   # 引擎 / 协议 / 持久化 / 房间回收（Node 内置 test runner）
-npm run test:ai            # 仅 AI 相关单测
+npm test                   # 引擎 / 协议 / 持久化 / 房间回收 / 大模型（Node 内置 test runner）
+npm run test:ai            # 仅规则引擎 AI 单测
+npm run test:llm           # 大模型 AI（内置 mock 模型服务，无需真实 Key）
 npm run test:persist       # 仅持久化
+npm run test:smoke:llm     # 手动冒烟：用 .env 里的真实模型跑一步（会产生真实调用）
 
 # 浏览器端到端（需要本机有可用的 Chrome / Chromium）
 npm run test:e2e           # 联机：建房、加入、走子、断线、观战

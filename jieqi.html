@@ -137,8 +137,8 @@
   .settings label { display: flex; align-items: center; gap: 6px; }
   .settings select { padding: 5px 8px; font-size: 13px; border: 1px solid #d8cdb8; border-radius: 6px;
     background: #fdfaf4; color: #4a3a25; cursor: pointer; }
-  .settings .pve-only { display: none; }
-  .settings.pve .pve-only { display: flex; }
+  .settings .pve-only, .settings .side-only { display: none; }
+  .settings.pve .pve-only, .settings.pve .side-only, .settings.llm .side-only { display: flex; }
   .settings .hint { color: #c0392b; font-size: 12px; }
   /* 联机面板：同卡片内第三行，仅"联机对战"模式显示 */
   .settings .online { display: none; width: 100%; padding-top: 9px; border-top: 1px solid #f0e7d6;
@@ -192,10 +192,11 @@
       <select id="modeSel">
         <option value="pvp">双人对战</option>
         <option value="pve" selected>人机对战</option>
+        <option value="llm">大模型 AI</option>
         <option value="online">联机对战</option>
       </select>
       </label>
-      <label class="pve-only">我执
+      <label class="side-only">我执
         <select id="sideSel">
           <option value="red">红方（先行）</option>
           <option value="black">黑方（后行）</option>
@@ -2541,9 +2542,9 @@ let aiThinking = false;  // AI 回合锁：true 时玩家不能操作棋盘
 let aiTimer   = null;    // AI 延时任务句柄
 let gameId    = 0;       // 棋局代次，用于作废旧任务（防串局）
 
-// 当前是否轮到 AI
+// 当前是否轮到 AI（人机或大模型 AI）
 function isAITurn(){
-  return gameMode==='pve' && !gameOver && currentTurn!==humanSide;
+  return (gameMode==='pve' || gameMode==='llm') && !gameOver && currentTurn!==humanSide;
 }
 
 // 终局文案：区分「吃将」与「无子可动」，避免只显示"XX 获胜"看不出原因
@@ -2597,7 +2598,7 @@ function updateStatus(){
     updateHintButton();
     return;
   }
-  if(gameMode==='pve'){
+  if(gameMode==='pve' || gameMode==='llm'){
     st.textContent = sideName + (currentTurn===humanSide ? '（你）走棋' : '（AI）思考中…');
   }else{
     st.textContent = sideName + ' 走棋';
@@ -2629,6 +2630,7 @@ function scheduleAI(delay){
 // 显示最近一次搜索的统计（仅在开启搜索的难度下）
 function updateAiInfo(){
   const el=document.getElementById('aiInfo'); if(!el) return;
+  if(gameMode==='llm'){ el.textContent = llmInfoText || ''; return; }
   if(gameMode!=='pve' || !lastSearch){ el.textContent=''; return; }
   const s=lastSearch;
   let txt='AI 搜索：完成深度 '+s.depth+' · 节点 '+s.nodes+(s.qnodes!=null?('+静态'+s.qnodes):'')+
@@ -2644,6 +2646,87 @@ function updateAiInfo(){
   el.textContent=txt;
 }
 
+// ==================== 大模型 AI：请求服务端选步 ====================
+// 大模型 AI 的「大脑」在服务端：前端只把当前执棋方有权看到的脱敏视图发给
+// /api/ai/move，服务端生成合法走法、调用模型、校验后返回一步，前端再走现有 makeMove。
+// 未翻开棋子的真实身份绝不离开本机：buildAIView 与服务端 toView 同一口径。
+let llmStatus = { configured:false, model:null, error:'' };   // 服务端 AI 配置状态
+let llmInfoText = '';                                            // aiInfo 展示文案
+
+// 构造当前执棋方有权看到的脱敏视图：
+// 未翻开棋子只保留 darkOwner/startType/startForward，绝不带真实 color/type。
+function buildAIView(){
+  const reveal = !!gameOver;
+  const b = board.map(row => row.map(p => {
+    if(!p) return null;
+    if(p.faceUp || reveal){
+      return { faceUp:true, color:p.color, type:p.type,
+               darkOwner: p.darkOwner || p.color,
+               startType:p.startType, startForward:p.startForward };
+    }
+    return { faceUp:false, darkOwner:p.darkOwner, startType:p.startType, startForward:p.startForward };
+  }));
+  return { board:b, currentTurn, gameOver, winner, winReason,
+           capturedRed, capturedBlack, moveLog, handNo, lastMove, moveTrail };
+}
+
+// 刷新服务端 AI 配置状态（只读，不涉及 Token）
+async function refreshLLMStatus(){
+  if(typeof location==='undefined' || (location.protocol!=='http:' && location.protocol!=='https:')){
+    llmStatus = { configured:false, model:null, error:'需通过 http 打开' };
+    renderLLMInfo(); return;
+  }
+  try{
+    const r = await fetch('/api/ai/status');
+    const j = await r.json();
+    if(j && j.ok){
+      llmStatus = { configured:!!j.configured, model:j.model||null, error:'' };
+    }else{
+      llmStatus = { configured:false, model:null, error:'服务端未返回状态' };
+    }
+  }catch(e){
+    llmStatus = { configured:false, model:null, error:'无法连接服务端' };
+  }
+  renderLLMInfo();
+}
+
+function renderLLMInfo(){
+  if(gameMode!=='llm'){ llmInfoText=''; updateAiInfo(); return; }
+  if(llmStatus.error){
+    llmInfoText = '大模型 AI：' + llmStatus.error + '（需通过 http 打开并启动 node server.js）';
+  }else if(!llmStatus.configured){
+    llmInfoText = '大模型 AI：服务端未配置（请在 server 的 .env 设置 AI_API_BASE / AI_API_TOKEN / AI_MODEL）';
+  }else{
+    llmInfoText = '大模型 AI：模型 ' + (llmStatus.model || '未指定');
+  }
+  updateAiInfo();
+}
+
+// 向服务端请求一步大模型走法；失败返回 {ok:false,msg}，绝不在本地瞎走
+async function requestLLMMove(){
+  if(typeof location==='undefined' || (location.protocol!=='http:' && location.protocol!=='https:')){
+    return { ok:false, msg:'大模型 AI 需要通过 http 打开（不能直接双击文件）' };
+  }
+  let r;
+  try{
+    r = await fetch('/api/ai/move', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(buildAIView()),
+    });
+  }catch(e){
+    return { ok:false, msg:'无法连接服务端（大模型 AI 需要本地服务端）' };
+  }
+  let j=null;
+  try{ j=await r.json(); }catch(e){}
+  if(!j || !j.ok){
+    return { ok:false, msg:(j && (j.msg || j.error)) || ('服务端返回 HTTP '+r.status) };
+  }
+  return { ok:true,
+           move:{ fr:j.from.r, fc:j.from.c, tr:j.to.r, tc:j.to.c },
+           reason:j.reason || '' };
+}
+
 // ==================== 提示（推荐着法，不自动落子） ====================
 let hintMove=null;        // {fr,fc,tr,tc}
 let hintPending=false;
@@ -2657,7 +2740,7 @@ function clearHint(){ hintMove=null; hintStats=null; hintNote=''; }
 function canUseHint(){
   if(gameOver || aiThinking || hintPending) return false;
   if(gameMode==='online') return false;
-  if(gameMode==='pve' && currentTurn!==humanSide) return false;
+  if((gameMode==='pve'||gameMode==='llm') && currentTurn!==humanSide) return false;
   return true;
 }
 
@@ -2712,17 +2795,37 @@ async function requestHint(){
 }
 
 // 执行一步 AI 走棋：选招与规则执行分离，仍走 makeMove，动画/记录/胜负全部复用
-// 搜索在 Worker 中异步进行，期间 aiThinking 保持 true，棋盘处于锁定状态
+// 大模型 AI 通过服务端选步，本地人机走 Worker 搜索；两者最终都复用同一落子流程
 async function performAIMove(gid){
-  const side=currentTurn, level=aiLevel;
-  const res = await runSearch('move', side, level);
+  let move=null, reason='', stats=null, failedMsg='';
 
-  if(gid!==gameId || !isAITurn()){ aiThinking=false; return; }   // 期间已新开/换边：丢弃
-  if(res.cancelled){ aiThinking=false; return; }
-  if(!res.move){ aiThinking=false; render(); return; }            // 无合法走法，尊重既有判负逻辑
+  if(gameMode==='llm'){
+    const res = await requestLLMMove();
+    if(gid!==gameId || !isAITurn()){ aiThinking=false; return; }   // 期间已新开/换边：丢弃
+    if(!res.ok){ failedMsg = res.msg || '大模型 AI 走棋失败'; }
+    else { move=res.move; reason=res.reason; }
+  }else{
+    const side=currentTurn, level=aiLevel;
+    const res = await runSearch('move', side, level);
+    if(gid!==gameId || !isAITurn()){ aiThinking=false; return; }   // 期间已新开/换边：丢弃
+    if(res.cancelled){ aiThinking=false; return; }
+    if(!res.move){ aiThinking=false; render(); return; }            // 无合法走法，尊重既有判负逻辑
+    move=res.move; stats=res.stats||null;
+  }
 
-  const mv=res.move;
-  const from={r:mv.fr, c:mv.fc}, to={r:mv.tr, c:mv.tc};
+  // 大模型返回失败：明确提示，绝不擅自执行非法走法
+  if(!move){
+    aiThinking=false;
+    if(failedMsg){
+      llmInfoText = '大模型 AI 走棋失败：' + failedMsg;
+      showToast(failedMsg);
+    }
+    updateAiInfo();
+    render();
+    return;
+  }
+
+  const from={r:move.fr, c:move.fc}, to={r:move.tr, c:move.tc};
   const tgt=board[to.r][to.c];
   const captured = tgt ? {color:tgt.color, type:tgt.type, faceUp:tgt.faceUp} : null;
 
@@ -2732,8 +2835,11 @@ async function performAIMove(gid){
   clearSelection();
   clearHint();                            // AI 一动手，旧提示即失效
   aiThinking=false;
+  if(gameMode==='llm'){
+    llmInfoText = '大模型 AI：' + (reason || '已走子');
+  }
   render();
-  lastSearch=res.stats||null; updateAiInfo();
+  lastSearch=stats; updateAiInfo();
 }
 
 // 应用下拉框配置到本局
@@ -2741,8 +2847,9 @@ async function performAIMove(gid){
 function updateNewGameAttention(){
   const b=document.getElementById('newBtn');
   if(!b || !b.classList) return;
+  const solo = pendingCfg.mode==='pve' || pendingCfg.mode==='llm';
   const dirty = pendingCfg.mode!==gameMode ||
-    (pendingCfg.mode==='pve' && (pendingCfg.side!==humanSide || pendingCfg.level!==aiLevel));
+    (solo && (pendingCfg.side!==humanSide || (pendingCfg.mode==='pve' && pendingCfg.level!==aiLevel)));
   b.classList.toggle('attention', dirty);
 }
 
@@ -2753,10 +2860,12 @@ function applySettings(){
   const box=document.getElementById('settings');
   if(box && box.classList){
     box.classList.toggle('pve', gameMode==='pve');
+    box.classList.toggle('llm', gameMode==='llm');
     box.classList.toggle('online-mode', gameMode==='online');
   }
   if(gameMode!=='online') clearPeek();
   onlineRenderInfo();
+  if(gameMode==='llm') renderLLMInfo();
   updateNewGameAttention();
 }
 
@@ -2801,7 +2910,8 @@ function undoHuman(){
   cancelSearch();                        // 悔棋后旧搜索结果一律作废
   clearHint(); hintPending=false;
   let ok=false, steps=0;
-  if(gameMode==='pve'){
+  const solo=(gameMode==='pve'||gameMode==='llm');
+  if(solo){
     do{
       if(!undo()) break;
       ok=true; steps++;
@@ -2816,7 +2926,7 @@ function undoHuman(){
   hideWin();
   render();
   // 撤到「AI 先手开局」这类边界时，交给 AI 重新走一步，避免卡在 AI 回合
-  if(gameMode==='pve' && !gameOver && currentTurn!==humanSide) scheduleAI(650);
+  if(solo && !gameOver && currentTurn!==humanSide) scheduleAI(650);
   return true;
 }
 
@@ -2956,7 +3066,7 @@ function buildSvg(){
 
 function render(){
   // 执黑时翻转棋盘（联机看我方阵营，人机看玩家阵营；本地双人同屏不翻转）
-  viewFlip = (gameMode==='online' && ONLINE.side==='black') || (gameMode==='pve' && humanSide==='black');
+  viewFlip = (gameMode==='online' && ONLINE.side==='black') || ((gameMode==='pve'||gameMode==='llm') && humanSide==='black');
   const boardEl=document.getElementById('board');
   boardEl.innerHTML='';
   boardEl.appendChild(buildSvg());
@@ -3113,6 +3223,7 @@ function onPieceClick(r,c){
     const box=document.getElementById('settings');
     if(box && box.classList){
       box.classList.toggle('pve', pendingCfg.mode==='pve');
+      box.classList.toggle('llm', pendingCfg.mode==='llm');
       box.classList.toggle('online-mode', pendingCfg.mode==='online');
     }
     if(pendingCfg.mode==='online'){
@@ -3120,6 +3231,13 @@ function onPieceClick(r,c){
       cancelAI();
       applySettings();
       if(hint) hint.textContent='创建或加入房间后即开始对局';
+      return;
+    }
+    if(pendingCfg.mode==='llm'){
+      // 大模型 AI 需要本地服务端：选到即探测服务端配置状态
+      refreshLLMStatus();
+      if(hint) hint.textContent='需启动服务端并配置 .env，点「新对局」生效';
+      updateNewGameAttention();
       return;
     }
     if(hint) hint.textContent='点「新对局」生效';
@@ -3612,6 +3730,7 @@ applySettings();
 setup();
 render();
 fitBoard();                                        // 按当前视口宽度自适应棋盘尺寸
+refreshLLMStatus();                                // 探测大模型 AI 服务端配置（仅读状态，不涉及密钥）
 if(typeof window!=='undefined') window.addEventListener('resize', fitBoard);
 if(isAITurn()) scheduleAI(700);
 

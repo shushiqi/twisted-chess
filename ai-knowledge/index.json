@@ -1,0 +1,101 @@
+{
+  "version": 1,
+  "defaultStrategy": "balanced",
+  "core": [
+    {
+      "id": "role",
+      "name": "角色与任务",
+      "file": "role.md",
+      "description": "AI 的角色定位、核心任务与信息边界",
+      "trigger": { "always": true }
+    },
+    {
+      "id": "rules",
+      "name": "揭棋规则",
+      "file": "rules.md",
+      "description": "项目实际实现的揭棋规则（以规则引擎代码为准）",
+      "trigger": { "always": true }
+    },
+    {
+      "id": "decision-principles",
+      "name": "决策原则",
+      "file": "decision-principles.md",
+      "description": "通用决策原则、合法走法约束、信息使用限制与返回格式",
+      "trigger": { "always": true }
+    }
+  ],
+  "skills": [
+    {
+      "id": "opening",
+      "name": "开局策略",
+      "file": "opening.md",
+      "description": "开局阶段的布子、出动与翻牌风险控制",
+      "trigger": { "handNoLte": 10 }
+    },
+    {
+      "id": "attack",
+      "name": "进攻策略",
+      "file": "attack.md",
+      "description": "存在吃子机会或主动进攻需求时的策略",
+      "trigger": { "hasCapture": true }
+    },
+    {
+      "id": "defense",
+      "name": "防守策略",
+      "file": "defense.md",
+      "description": "将帅安全风险或防守需求时的策略",
+      "trigger": { "inCheck": true }
+    },
+    {
+      "id": "hidden-pieces",
+      "name": "暗子策略",
+      "file": "hidden-pieces.md",
+      "description": "暗子与不确定性处理策略",
+      "trigger": { "hasHiddenPieces": true }
+    },
+    {
+      "id": "piece-value",
+      "name": "子力价值",
+      "file": "piece-value.md",
+      "description": "棋子价值与子力交换策略",
+      "trigger": { "hasCapture": true }
+    },
+    {
+      "id": "positional-play",
+      "name": "局面控制",
+      "file": "positional-play.md",
+      "description": "局面控制与棋子协同（中局及以后）",
+      "trigger": { "handNoGte": 11 }
+    },
+    {
+      "id": "endgame",
+      "name": "残局策略",
+      "file": "endgame.md",
+      "description": "残局阶段的精确计算与攻将策略",
+      "trigger": { "remainingPiecesLte": 8 }
+    }
+  ],
+  "strategies": [
+    {
+      "id": "aggressive",
+      "name": "激进",
+      "file": "aggressive.md",
+      "description": "激进进攻棋风",
+      "trigger": { "always": true }
+    },
+    {
+      "id": "defensive",
+      "name": "防守",
+      "file": "defensive.md",
+      "description": "稳健防守棋风",
+      "trigger": { "always": true }
+    },
+    {
+      "id": "balanced",
+      "name": "均衡",
+      "file": "balanced.md",
+      "description": "均衡棋风（默认）",
+      "trigger": { "always": true }
+    }
+  ]
+}

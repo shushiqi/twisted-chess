@@ -137,7 +137,7 @@ async function main() {
   }
   console.log(dryRun
     ? '干跑通过：脚本流程与仓库接口契约正确。配置真实凭据后去掉 --dry-run 再跑一次即可验证 CloudBase。'
-    : '集成验证结束：全部 PASS，可按 README 的「房间持久化（可选）」一节配置部署环境变量。');
+    : '集成验证结束：全部 PASS，可按 README 的「房间持久化（可选）」一节配置 Render 环境变量。');
 }
 
 main().catch(e => { console.error('集成验证异常：', (e && e.message) || e); process.exit(1); });

@@ -1,11 +1,11 @@
 'use strict';
 // 引擎切片契约测试（node --test）
 // 背景：server.js:loadEngine() 用 jieqi.html 里的一对注释标记切出「规则 + 搜索」源码，
-//       再 new Function 执行。同一套切片逻辑在 jieqi.html 的 Worker 内联里还有一份实现，
-//       此前没有任何测试保护。
+//       再 new Function 执行。同一套切片逻辑另有若干份实现（如 jieqi.html 的 Worker 内联），
+//       此前**没有任何测试保护**。
 // 本文件防的事故：
-//   1) 标记被误改 / 误挪 / 删掉一行 → 服务端静默拿到残缺引擎（规则错乱）；
-//   2) 两份实现里只改了一部分标记 → 页面能跑、服务端却崩；
+//   1) 标记被误改 / 误挪 / 删掉一行 → 服务端与其它切片实现静默拿到残缺引擎（规则错乱、AI 基线漂移）；
+//   2) 各处实现里只改了一部分标记 → 页面能跑、服务端却崩；
 //   3) 切片边界写错 → 把标记注释本身、甚至 UI 代码带进 new Function；
 //   4) 引擎段悄悄引入浏览器 API（document/window/localStorage/alert）或 require →
 //      Node 端 loadEngine 直接抛错，联机整体不可用。
@@ -122,14 +122,18 @@ test('引擎标记完整且独立成行（防标记被误改 / 误删 / 误挪�
 });
 
 test('各处切片实现共用同一对标记（防改标记时漏改某一份）', () => {
-  // 随仓库发布的实现必须存在；仅在开发环境可用的基准脚本存在时才一并校验。
   const required = ['server.js', 'jieqi.html'];
-  const optional = ['tests/ai-arena.mjs', 'tests/ai-sampling.mjs']
-    .filter(rel => fs.existsSync(path.join(ROOT, rel)));
-  const files = required.concat(optional);
-  for (const rel of files) {
+  // 仓库内可能另有基准脚本等额外切片实现；存在才校验，缺失不算失败。
+  const optional = ['tests/ai-arena.mjs', 'tests/ai-sampling.mjs'];
+
+  for (const rel of required) {
     const abs = path.join(ROOT, rel);
     assert.ok(fs.existsSync(abs), rel + ' 不存在：切片实现文件被改名 / 移走时必须同步本测试');
+  }
+  const present = optional.filter(rel => fs.existsSync(path.join(ROOT, rel)));
+
+  for (const rel of required.concat(present)) {
+    const abs = path.join(ROOT, rel);
     const txt = fs.readFileSync(abs, 'utf8');
     assert.ok(txt.includes(MARK_START),
       rel + ' 中缺少 ' + MARK_START + '（改标记时必须各处同步修改）');

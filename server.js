@@ -16,6 +16,28 @@ const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { SCHEMA_VERSION, createRoomRepositoryFromEnv } = require('./roomRepository');
+const aiKnowledge = require('./aiKnowledge');
+
+// ---------- 本地 .env 加载（不引入 dotenv 依赖） ----------
+// 只在缺失时填充 process.env，已存在的真实环境变量优先（部署平台注入的值不被覆盖）。
+// 真实 Token 只留在本地 .env（已被 .gitignore 忽略），绝不写入源码 / Git / 日志。
+function loadDotEnv(file) {
+  let text;
+  try { text = fs.readFileSync(file, 'utf8'); } catch (e) { return; }   // 没有 .env 时静默跳过
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 1) continue;
+    const key = line.slice(0, eq).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))
+      val = val.slice(1, -1);
+    if (!(key in process.env)) process.env[key] = val;
+  }
+}
+loadDotEnv(path.join(__dirname, '.env'));
 
 const ROOT = __dirname;
 const PAGE_FILE = path.join(ROOT, 'jieqi.html');
@@ -55,6 +77,199 @@ function loadEngine(file = PAGE_FILE) {
 // 互相截断/重写。服务端绝不调用 undo()，因此无正确性影响；
 // 若将来要在服务端实现悔棋，必须改为每个房间独立引擎实例。
 const engine = loadEngine();
+
+// ==================== 大模型 AI 对弈（服务端调用 OpenAI 兼容接口） ====================
+// 设计约束：
+//  · AI 只能获得「当前执棋方有权看到」的信息：未翻开棋子只有 darkOwner/startType/startForward，
+//    绝不把真实 color/type 发给模型；无论客户端上报什么，送模型前一律经 sanitizeBoardForAI 过滤。
+//  · 合法走法由服务端引擎（与对局同一套规则）生成，模型只能从中选择，服务端再次校验。
+//  · 使用独立的 engineAI 实例：模型请求是异步网络调用，不能与房间引擎的全局局面互相覆盖。
+const DEFAULT_AI_TIMEOUT_MS = 30000;
+const DEFAULT_AI_MAX_ATTEMPTS = 3;
+
+function aiConfig() {
+  const base = (process.env.AI_API_BASE || 'https://api.openai.com/v1').replace(/\/+$/, '');
+  return {
+    base,
+    token: process.env.AI_API_TOKEN || '',
+    model: process.env.AI_MODEL || '',
+    timeoutMs: Number(process.env.AI_TIMEOUT_MS) > 0 ? Number(process.env.AI_TIMEOUT_MS) : DEFAULT_AI_TIMEOUT_MS,
+    maxAttempts: Number(process.env.AI_MAX_ATTEMPTS) > 0 ? Number(process.env.AI_MAX_ATTEMPTS) : DEFAULT_AI_MAX_ATTEMPTS,
+  };
+}
+function aiConfigured() {
+  const c = aiConfig();
+  return !!(c.token && c.model);
+}
+
+// AI 专用引擎实例（与房间引擎隔离）
+const engineAI = loadEngine();
+
+// 把任意棋盘收敛为「当前执棋方有权看到」的视图：
+// 未翻开棋子只保留 darkOwner/startType/startForward，绝不保留真实 color/type。
+function sanitizeBoardForAI(board) {
+  return (Array.isArray(board) ? board : []).map(row => (Array.isArray(row) ? row : []).map(p => {
+    if (!p) return null;
+    if (p.faceUp) {
+      return { faceUp: true, color: p.color, type: p.type, darkOwner: p.darkOwner || p.color };
+    }
+    return {
+      faceUp: false,
+      darkOwner: p.darkOwner || null,
+      startType: p.startType || null,
+      startForward: p.startForward != null ? p.startForward : null,
+    };
+  }));
+}
+
+// 由客户端上报的脱敏视图构造引擎可加载的完整状态（historyLength 固定为 0，AI 不需要悔棋栈）
+function buildAIGameState(input) {
+  const o = input || {};
+  const turn = o.currentTurn === 'black' ? 'black' : 'red';
+  return JSON.stringify({
+    board: sanitizeBoardForAI(o.board),
+    currentTurn: turn,
+    gameOver: false, winner: null, winReason: null,
+    capturedRed: Array.isArray(o.capturedRed) ? o.capturedRed : [],
+    capturedBlack: Array.isArray(o.capturedBlack) ? o.capturedBlack : [],
+    moveLog: Array.isArray(o.moveLog) ? o.moveLog : [],
+    handNo: Number(o.handNo) || 0,
+    lastMove: o.lastMove || null,
+    moveTrail: Array.isArray(o.moveTrail) ? o.moveTrail : [],
+    historyLength: 0,
+  });
+}
+
+// 文本棋盘：明子显示真实身份，暗子只标归属（红?/黑?），不泄露真实身份
+function boardToText(board) {
+  const names = engineAI.PIECE_NAME;
+  const lines = [];
+  for (let r = 0; r < ROWS; r++) {
+    const cells = [];
+    for (let c = 0; c < COLS; c++) {
+      const p = board[r][c];
+      if (!p) { cells.push('·'); continue; }
+      if (p.faceUp) cells.push(names[p.color][p.type]);
+      else cells.push(p.darkOwner === 'red' ? '红?' : '黑?');
+    }
+    lines.push(cells.join(' '));
+  }
+  return lines.join('\n');
+}
+
+function movesToText(moves) {
+  return moves.map((m, i) => (i + 1) + '. (' + m.fr + ',' + m.fc + ') -> (' + m.tr + ',' + m.tc + ')').join('\n');
+}
+
+// 调用 OpenAI 兼容的 /chat/completions，带超时
+async function callChatModel(messages, timeoutMs) {
+  const c = aiConfig();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(c.base + '/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + c.token,
+      },
+      body: JSON.stringify({ model: c.model, messages, thinking: { type: 'disabled' } }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => '');
+      throw new Error('模型接口返回 HTTP ' + res.status + (txt ? ('：' + txt.slice(0, 200)) : ''));
+    }
+    const data = await res.json();
+    const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+    if (typeof content !== 'string' || !content.trim()) throw new Error('模型接口未返回内容');
+    return content;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 从模型输出中稳健地提取 JSON 对象
+function parseModelJson(content) {
+  if (typeof content !== 'string') return null;
+  let s = content.trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  const a = s.indexOf('{'), b = s.lastIndexOf('}');
+  if (a >= 0 && b > a) s = s.slice(a, b + 1);
+  try { const o = JSON.parse(s); return o && typeof o === 'object' ? o : null; } catch (e) { return null; }
+}
+
+// 校验模型给出的走法确实存在于合法走法列表
+function normalizeAIMove(obj, legal) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (!isCoord(obj.from) || !isCoord(obj.to)) return null;
+  return legal.find(m => m.fr === obj.from.r && m.fc === obj.from.c && m.tr === obj.to.r && m.tc === obj.to.c) || null;
+}
+
+// 核心：给定脱敏视图，让模型选一步并校验。返回 {ok,...} 或 {ok:false,error,msg}
+async function aiMoveFromView(input) {
+  if (!aiConfigured()) {
+    return { ok: false, error: 'ai_not_configured', msg: '服务端未配置大模型（请在 .env 设置 AI_API_BASE / AI_API_TOKEN / AI_MODEL）' };
+  }
+  if (!input || !Array.isArray(input.board)) return { ok: false, error: 'bad_params', msg: '缺少棋盘数据' };
+  if (input.gameOver) return { ok: false, error: 'game_over', msg: '对局已结束' };
+
+  engineAI.loadState(buildAIGameState(input));
+  if (engineAI.gameOver) return { ok: false, error: 'game_over', msg: '对局已结束' };
+  const turn = engineAI.turn;
+  const legal = engineAI.collectMoves(turn);
+  if (!legal.length) return { ok: false, error: 'no_moves', msg: '当前没有合法走法' };
+
+  const historyText = (Array.isArray(input.moveLog) ? input.moveLog : []).slice(-20).join('\n');
+  // 知识库：Core + 棋风策略 + 按棋局特征命中的 Skills 组合进 System Prompt。
+  // 知识只影响提示词，不改变合法走法校验与落子流程。
+  const strategyName = aiKnowledge.resolveStrategyName(input);
+  const sys = aiKnowledge.buildSystemPromptForState(engineAI, input, strategyName);
+  const messages = [
+    { role: 'system', content: sys.prompt },
+    { role: 'user', content: [
+      '当前行棋方：' + (turn === 'red' ? '红方' : '黑方'),
+      '棋盘（行 0 在上、列 0 在左；· 为空格；明子显示真实身份；红?/黑? 为未翻开暗子，仅标注当前归属，真实身份未知）：',
+      boardToText(engineAI.board),
+      historyText ? ('最近走法：\n' + historyText) : '',
+      '合法走法列表（只能从中选择一步）：',
+      movesToText(legal),
+      '请只返回 JSON。',
+    ].filter(Boolean).join('\n') },
+  ];
+
+  const cfg = aiConfig();
+  let lastErr = '模型未返回可用走法';
+  for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
+    let content;
+    try {
+      content = await callChatModel(messages, cfg.timeoutMs);
+    } catch (e) {
+      lastErr = '调用模型失败：' + ((e && e.message) || e);
+      continue;
+    }
+    const obj = parseModelJson(content);
+    if (!obj) {
+      lastErr = '模型返回不是合法 JSON';
+    } else {
+      const hit = normalizeAIMove(obj, legal);
+      if (hit) {
+        return {
+          ok: true,
+          from: { r: hit.fr, c: hit.fc },
+          to: { r: hit.tr, c: hit.tc },
+          reason: typeof obj.reason === 'string' ? obj.reason.slice(0, 120) : '',
+        };
+      }
+      lastErr = '模型选择的走法不在合法走法列表中';
+    }
+    // 追加纠错上下文，让模型在剩余次数内修正
+    messages.push({ role: 'assistant', content });
+    messages.push({ role: 'user', content: '上一步返回的走法不合法。请严格从合法走法列表中重新选择一步，只返回 JSON。' });
+  }
+  return { ok: false, error: 'ai_move_invalid', msg: lastErr };
+}
 
 // ---------- 房间 ----------
 // 权威结构：seats(固定 2 个玩家位) + specs(观战位数组，上限 specCap=3/4/5) + ownerToken
@@ -1067,6 +1282,26 @@ async function detachExplicitLocked(room, m) {
 }
 
 // ---------- HTTP ----------
+// 读取并解析 JSON 请求体（带大小上限，防滥用）
+function readJsonBody(req, limit) {
+  return new Promise((resolve, reject) => {
+    const cap = limit || 64 * 1024;
+    let size = 0;
+    const chunks = [];
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size > cap) { reject(new Error('请求体过大')); req.destroy(); return; }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8');
+      if (!text.trim()) { resolve(null); return; }
+      try { resolve(JSON.parse(text)); } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
 function sendJSON(res, code, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(code, {
@@ -1100,6 +1335,31 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, {
       ok: true, uptime: Math.round(process.uptime()), rooms: rooms.size, ws: wss.clients.size,
       persistence: storageInfo(),
+    });
+  }
+
+  // 大模型 AI：状态查询（只暴露是否已配置与模型名，绝不返回 Token）
+  if (req.method === 'GET' && p === '/api/ai/status') {
+    const c = aiConfig();
+    return sendJSON(res, 200, { ok: true, configured: aiConfigured(), model: c.model || null });
+  }
+  // 大模型 AI：根据脱敏视图选一步（服务端调用模型 API + 合法走法校验）
+  if (req.method === 'POST' && p === '/api/ai/move') {
+    let input;
+    try { input = await readJsonBody(req, 64 * 1024); }
+    catch (e) { return sendJSON(res, 400, { ok: false, error: 'bad_json', msg: '请求体不是合法 JSON' }); }
+    if (!input) return sendJSON(res, 400, { ok: false, error: 'bad_params', msg: '缺少请求体' });
+    const r = await aiMoveFromView(input);
+    return sendJSON(res, r.ok ? 200 : 400, r);
+  }
+  // 大模型 AI：热重载本地知识库（修改知识文件后无需重启服务）
+  if (req.method === 'POST' && p === '/api/ai/knowledge/reload') {
+    const k = aiKnowledge.reload();
+    return sendJSON(res, 200, {
+      ok: true,
+      core: k.index.core.length,
+      skills: k.index.skills.length,
+      strategies: k.index.strategies.length,
     });
   }
 
@@ -1294,4 +1554,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = { server, wss, start, stop, shutdown, loadEngine, createRoom, rooms, toView, playerCount, shouldReapRoom, initPersistence, storageInfo };
+module.exports = { server, wss, start, stop, shutdown, loadEngine, createRoom, rooms, toView, playerCount, shouldReapRoom, initPersistence, storageInfo,
+  aiConfig, aiConfigured, sanitizeBoardForAI, aiMoveFromView, engineAI };

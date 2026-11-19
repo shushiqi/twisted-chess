@@ -6,7 +6,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test tests/engine.test.js tests/engine-contract.test.js tests/ai.test.js tests/mp.test.js tests/persist.test.js tests/persist-config.test.js tests/reap.test.js",
+    "test": "node --test tests/engine.test.js tests/engine-contract.test.js tests/ai.test.js tests/ai-llm.test.js tests/ai-knowledge.test.js tests/mp.test.js tests/persist.test.js tests/persist-config.test.js tests/reap.test.js",
+    "test:llm": "node tests/ai-llm.test.js",
+    "test:smoke:llm": "node tests/smoke-llm.js",
     "test:persist": "node --test tests/persist.test.js tests/persist-config.test.js",
     "test:ai": "node --test tests/ai.test.js",
     "test:cloudbase": "node tests/cloudbase-integration.mjs",
