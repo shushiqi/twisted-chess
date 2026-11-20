@@ -181,6 +181,43 @@
   #winBox .row { margin-top: 18px; display: flex; gap: 10px; justify-content: center; }
   #winBox .secondary { background: #ece4d5; color: #6b5330; }
   #winBox .secondary:hover { background: #ded2bd; }
+
+  /* 大模型配置：入口 + 弹窗 */
+  .llm-config { display: none; width: 100%; padding-top: 9px; border-top: 1px solid #f0e7d6;
+    flex-direction: column; align-items: center; gap: 8px; }
+  .settings.llm .llm-config { display: flex; }
+  .config-entry { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: center;
+    font-size: 13px; color: #4a3a25; }
+  .config-entry code { background: #f5efe4; border-radius: 4px; padding: 1px 6px; font-size: 12px; }
+  .config-entry button { padding: 4px 12px; font-size: 12px; border: 1px solid #d8cdb8; border-radius: 6px;
+    background: #fdfaf4; color: #4a3a25; cursor: pointer; }
+  .config-entry button:hover { background: #f2e9d8; }
+
+  #llmConfigModal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5);
+    align-items: center; justify-content: center; z-index: 11; padding: 16px; }
+  #llmConfigModal.show { display: flex; }
+  #llmConfigBox { background: #fff; border-radius: 12px; padding: 24px 28px; width: 100%; max-width: 460px;
+    box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+  #llmConfigBox h3 { margin: 0 0 14px; font-size: 18px; color: #7a4a1f; text-align: center; }
+  .config-rows { display: flex; flex-direction: column; gap: 12px; }
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-size: 13px; color: #666; }
+  .field input { padding: 7px 10px; font-size: 13px; border: 1px solid #d8cdb8; border-radius: 6px;
+    background: #fdfaf4; color: #4a3a25; }
+  .field input:focus { outline: none; border-color: #c9b693; background: #fff; }
+  .token-toggle { display: flex; gap: 8px; align-items: center; }
+  .token-toggle input { flex: 1; }
+  .token-toggle button { padding: 6px 12px; font-size: 12px; border: 1px solid #d8cdb8; border-radius: 6px;
+    background: #fdfaf4; color: #4a3a25; cursor: pointer; }
+  .token-toggle button:disabled { opacity: .5; cursor: default; }
+  .config-actions { margin-top: 16px; display: flex; gap: 10px; justify-content: center; }
+  .config-actions button { padding: 7px 18px; font-size: 13px; border: 1px solid #d8cdb8; border-radius: 6px;
+    background: #fdfaf4; color: #4a3a25; cursor: pointer; }
+  .config-actions button:hover { background: #f2e9d8; }
+  .cfg-status { margin-top: 10px; font-size: 12px; text-align: center; min-height: 16px; }
+  .cfg-status.bad { color: #c0392b; }
+  .cfg-status.ok { color: #2e7d32; }
+  .cfg-tip { display: block; color: #a89a85; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -217,6 +254,7 @@
       <button id="hintBtn">提示</button>
       <button id="newBtn">新对局</button>
     </div>
+    <div class="llm-config" id="llmConfigEntry"></div>
     <div class="online" id="onlineCard">
       <div class="online-row">
         <button id="createRoomBtn">创建房间</button>
@@ -283,6 +321,11 @@
         <button class="secondary" id="viewBoardBtn">查看棋盘</button>
       </div>
     </div>
+  </div>
+
+  <!-- 大模型配置弹窗 -->
+  <div id="llmConfigModal">
+    <div id="llmConfigBox"></div>
   </div>
 
 <script>
@@ -2680,24 +2723,261 @@ async function refreshLLMStatus(){
     const r = await fetch('/api/ai/status');
     const j = await r.json();
     if(j && j.ok){
-      llmStatus = { configured:!!j.configured, model:j.model||null, error:'' };
+      llmStatus = {
+        configured:!!j.configured,
+        model:j.model||null,
+        baseUrl:j.baseUrl||null,
+        source:j.source||null,
+        error:''
+      };
     }else{
-      llmStatus = { configured:false, model:null, error:'服务端未返回状态' };
+      llmStatus = { configured:false, model:null, baseUrl:null, error:'服务端未返回状态' };
     }
   }catch(e){
-    llmStatus = { configured:false, model:null, error:'无法连接服务端' };
+    llmStatus = { configured:false, model:null, baseUrl:null, error:'无法连接服务端' };
   }
   renderLLMInfo();
+}
+
+// ==================== 用户自定义大模型配置（localStorage） ====================
+// 目标：用户选择「大模型 AI」时，优先使用本地已有配置，否则弹出配置窗口填写后保存。
+// 约束：配置仅存当前浏览器 localStorage，不加密、不做外部存储，不写进项目文件或日志。
+let llmConfig = null;        // { baseUrl, apiToken, model }
+let configOpen = false;      // 是否弹配置窗口
+let llmPrevMode = null;      // 进入大模型 AI 且无配置时记录的原模式（取消时回退）
+
+function llmConfigKey() { return 'jieqi_llm_config'; }
+
+function loadLlmConfig() {
+  try {
+    const raw = localStorage.getItem(llmConfigKey());
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || typeof o !== 'object') return null;
+    const baseUrl = String(o.baseUrl || '').trim();
+    const token = String(o.apiToken || '').trim();
+    const model = String(o.model || '').trim();
+    if (!baseUrl || !token || !model) return null;
+    return { baseUrl, apiToken: token, model };
+  } catch (e) {
+    // JSON 解析异常/存储异常：视为无配置，回到「弹出配置窗口」路径，而不是静默失败。
+    return null;
+  }
+}
+
+function saveLlmConfig(cfg) {
+  // 保存前校验必填字段，避免无效配置被写入 localStorage
+  if (!cfg || typeof cfg !== 'object') return false;
+  if (!String(cfg.baseUrl || '').trim()) return false;
+  if (!String(cfg.apiToken || '').trim()) return false;
+  if (!String(cfg.model || '').trim()) return false;
+  try {
+    localStorage.setItem(llmConfigKey(), JSON.stringify(cfg));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function clearLlmConfig() {
+  try { localStorage.removeItem(llmConfigKey()); } catch (e) {}
+  llmConfig = null;
+}
+
+function getSavedLlmConfig() { return llmConfig; }
+
+function showConfigModal() {
+  if (configOpen) return;
+  configOpen = true;
+  const modal = document.getElementById('llmConfigModal');
+  if (modal) modal.classList.add('show');
+  renderConfigForm();
+}
+
+function closeConfigModal() {
+  configOpen = false;
+  const modal = document.getElementById('llmConfigModal');
+  if (modal) modal.classList.remove('show');
+}
+
+// 取消配置：关闭弹窗并回退模式选择，不进入大模型 AI 对局
+function cancelConfigModal() {
+  closeConfigModal();
+  if (!llmPrevMode) return;
+  const modeSel = document.getElementById('modeSel');
+  if (modeSel) modeSel.value = llmPrevMode;
+  pendingCfg.mode = llmPrevMode;
+  const box = document.getElementById('settings');
+  if (box && box.classList){
+    box.classList.toggle('pve', pendingCfg.mode==='pve');
+    box.classList.toggle('llm', pendingCfg.mode==='llm');
+    box.classList.toggle('online-mode', pendingCfg.mode==='online');
+  }
+  const hint = document.getElementById('settingsHint');
+  if (hint) hint.textContent='';
+  llmPrevMode = null;
+  updateNewGameAttention();
+}
+
+function revertLlmModeSelection() { cancelConfigModal(); }
+
+function renderConfigForm() {
+  const box = document.getElementById('llmConfigBox');
+  if (!box) return;
+  // 预填：优先已保存配置；无保存配置时，用服务端 .env 的非敏感默认值（Base URL / Model）预填，
+  // 绝不允许把服务端 Token 或任何 Token 预填进表单。
+  const saved = llmConfig || null;
+  const envBase = (llmStatus && llmStatus.baseUrl) || '';
+  const envModel = (llmStatus && llmStatus.model) || '';
+  const cfg = {
+    baseUrl: (saved && saved.baseUrl) || envBase || '',
+    model: (saved && saved.model) || envModel || '',
+    apiToken: (saved && saved.apiToken) || '',
+  };
+  box.innerHTML = `
+    <h3>大模型配置</h3>
+    <div class="config-rows">
+      <div class="field"><label for="cfgBaseUrl">API Base URL</label>
+        <input id="cfgBaseUrl" type="text" placeholder="https://api.openai.com/v1" value="${escapeAttr(cfg.baseUrl)}" autocomplete="off"></div>
+      <div class="field"><label for="cfgModel">Model</label>
+        <input id="cfgModel" type="text" placeholder="spark-x2.6" value="${escapeAttr(cfg.model)}" autocomplete="off"></div>
+    </div>
+    <div class="field token-row">
+      <label for="cfgToken">API Token（仅用于本机服务端，不会显示在页面或日志中）</label>
+      <div class="token-toggle">
+        <button id="cfgTokenShow" type="button">显示</button>
+        <input id="cfgToken" type="password" autocomplete="off" placeholder="请输入 API Token" value="${escapeAttr(cfg.apiToken)}">
+        <button id="cfgTokenHide" type="button">隐藏</button>
+      </div>
+    </div>
+    <div class="config-actions">
+      <button id="cfgSave" type="button">保存配置</button>
+      <button id="cfgCancel" type="button">取消</button>
+    </div>
+    <div id="cfgStatus" class="cfg-status"></div>
+    <span class="cfg-tip">配置仅保存在当前浏览器（localStorage），不上传服务端、不加密，请勿在公共设备填写。</span>`;
+  document.getElementById('cfgBaseUrl').value = cfg.baseUrl;
+  document.getElementById('cfgModel').value = cfg.model;
+  document.getElementById('cfgToken').value = cfg.apiToken;
+  bindConfigFormEvents();
+  renderConfigStatus();
+}
+
+function bindConfigFormEvents() {
+  const input = document.getElementById('cfgToken');
+  const show = document.getElementById('cfgTokenShow');
+  const hide = document.getElementById('cfgTokenHide');
+  if (show && input) show.addEventListener('click', ()=>{ input.type='text'; show.disabled=true; if(hide) hide.disabled=false; });
+  if (hide && input) hide.addEventListener('click', ()=>{ input.type='password'; if(show) show.disabled=false; hide.disabled=true; });
+  if (show) show.disabled = true;
+  if (hide) hide.disabled = false;
+  const save = document.getElementById('cfgSave');
+  if (save) save.addEventListener('click', saveConfigFromForm);
+  const cancel = document.getElementById('cfgCancel');
+  if (cancel) cancel.addEventListener('click', cancelConfigModal);
+}
+
+function saveConfigFromForm() {
+  const baseUrl = document.getElementById('cfgBaseUrl').value.trim();
+  const model = document.getElementById('cfgModel').value.trim();
+  const apiToken = document.getElementById('cfgToken').value.trim();
+  const el = document.getElementById('cfgStatus');
+  if (!baseUrl || !apiToken || !model) {
+    if (el) { el.textContent = 'API Base URL、API Token、Model 均为必填项。'; el.className = 'cfg-status bad'; }
+    return;
+  }
+  if (!/^https?:\/\//i.test(baseUrl)) {
+    if (el) { el.textContent = 'API Base URL 需为 http:// 或 https:// 开头的合法地址。'; el.className = 'cfg-status bad'; }
+    return;
+  }
+  const cfg = { baseUrl, apiToken, model };
+  if (!saveLlmConfig(cfg)) {
+    if (el) { el.textContent = '保存失败：localStorage 不可用或写入失败。'; el.className = 'cfg-status bad'; }
+    return;
+  }
+  llmConfig = cfg;
+  llmPrevMode = null;          // 保存成功：进入大模型 AI 模式，不再回退
+  closeConfigModal();
+  pendingCfg.mode = 'llm';
+  renderConfigEntry();
+  refreshLLMStatus();
+  renderLLMInfo();
+  updateAiInfo();
+  updateNewGameAttention();
+}
+
+function renderConfigStatus(msg) {
+  const el = document.getElementById('cfgStatus');
+  if (!el) return;
+  if (msg) { el.textContent = msg; el.className = 'cfg-status bad'; return; }
+  if (!cfgSaved()) {
+    el.textContent = '未检测到本地配置：首次使用请填写并保存。';
+    el.className = 'cfg-status bad';
+    return;
+  }
+  el.textContent = '已保存：Base URL=' + llmConfig.baseUrl + '，Model=' + llmConfig.model + '，当前用于大模型 AI 对弈。';
+  el.className = 'cfg-status ok';
+}
+
+function cfgSaved() { return !!(llmConfig && llmConfig.baseUrl && llmConfig.apiToken && llmConfig.model); }
+
+// 纯决策函数：大模型模式选择的动作，便于无浏览器环境测试选择流程。
+//  - saved=true  → 'ready'：已有有效配置，直接进入对局
+//  - saved=false → 'prompt'：无配置，需要弹出配置窗口
+function decideLlmModeSelection(saved) { return saved ? 'ready' : 'prompt'; }
+
+function escapeAttr(v) {
+  if (v === null || v === undefined) return '';
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function renderConfigEntry() {
+  const box = document.getElementById('llmConfigEntry');
+  if (!box) return;
+  if (cfgSaved()) {
+    const cfg = llmConfig;
+    box.innerHTML = `
+      <div class="config-entry">
+        <span>已保存模型：<code>${escapeAttr(cfg.model)}</code></span>
+        <button id="cfgEditBtn" type="button">修改配置</button>
+        <button id="cfgClearBtn" type="button">清除配置</button>
+      </div>`;
+    document.getElementById('cfgEditBtn').addEventListener('click', ()=>{ openConfigModal(); });
+    document.getElementById('cfgClearBtn').addEventListener('click', ()=>{ clearLlmConfig(); renderConfigEntry(); renderLLMInfo(); updateAiInfo(); });
+  } else {
+    box.innerHTML = `
+      <div class="config-entry">
+        <span>未配置大模型</span>
+        <button id="cfgSetupBtn" type="button">模型配置</button>
+      </div>`;
+    document.getElementById('cfgSetupBtn').addEventListener('click', ()=>{ openConfigModal(); });
+  }
+}
+
+function openConfigModal() {
+  if (!llmConfig) llmConfig = loadLlmConfig();
+  showConfigModal();
+}
+
+function syncConfigUI() {
+  llmConfig = loadLlmConfig();
+  renderConfigEntry();
+  renderLLMInfo();
+  updateAiInfo();
 }
 
 function renderLLMInfo(){
   if(gameMode!=='llm'){ llmInfoText=''; updateAiInfo(); return; }
   if(llmStatus.error){
     llmInfoText = '大模型 AI：' + llmStatus.error + '（需通过 http 打开并启动 node server.js）';
-  }else if(!llmStatus.configured){
-    llmInfoText = '大模型 AI：服务端未配置（请在 server 的 .env 设置 AI_API_BASE / AI_API_TOKEN / AI_MODEL）';
+  }else if(cfgSaved()){
+    // 用户本地配置优先展示，但不暴露 Token
+    llmInfoText = '大模型 AI：本地配置，模型 ' + (llmConfig.model || '未指定') + '（Token 仅存本机浏览器）';
+  }else if(llmStatus.configured){
+    llmInfoText = '大模型 AI：使用服务端默认配置，模型 ' + (llmStatus.model || '未指定');
   }else{
-    llmInfoText = '大模型 AI：模型 ' + (llmStatus.model || '未指定');
+    llmInfoText = '大模型 AI：服务端未配置（请在 server 的 .env 设置，或点「模型配置」填写本地配置）';
   }
   updateAiInfo();
 }
@@ -2707,12 +2987,15 @@ async function requestLLMMove(){
   if(typeof location==='undefined' || (location.protocol!=='http:' && location.protocol!=='https:')){
     return { ok:false, msg:'大模型 AI 需要通过 http 打开（不能直接双击文件）' };
   }
+  // 用户本地配置优先：携带 config 字段，服务端优先使用；无配置则不带，服务端回退 .env
+  const cfg = cfgSaved() ? { baseUrl: llmConfig.baseUrl, apiToken: llmConfig.apiToken, model: llmConfig.model } : null;
+  const body = Object.assign(buildAIView(), cfg ? { config: cfg } : {});
   let r;
   try{
     r = await fetch('/api/ai/move', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(buildAIView()),
+      body: JSON.stringify(body),
     });
   }catch(e){
     return { ok:false, msg:'无法连接服务端（大模型 AI 需要本地服务端）' };
@@ -2720,7 +3003,8 @@ async function requestLLMMove(){
   let j=null;
   try{ j=await r.json(); }catch(e){}
   if(!j || !j.ok){
-    return { ok:false, msg:(j && (j.msg || j.error)) || ('服务端返回 HTTP '+r.status) };
+    const msg = (j && (j.message || j.msg || j.error)) || ('服务端返回 HTTP '+r.status);
+    return { ok:false, msg:msg, category:(j && j.category) || null };
   }
   return { ok:true,
            move:{ fr:j.from.r, fc:j.from.c, tr:j.to.r, tc:j.to.c },
@@ -2797,12 +3081,12 @@ async function requestHint(){
 // 执行一步 AI 走棋：选招与规则执行分离，仍走 makeMove，动画/记录/胜负全部复用
 // 大模型 AI 通过服务端选步，本地人机走 Worker 搜索；两者最终都复用同一落子流程
 async function performAIMove(gid){
-  let move=null, reason='', stats=null, failedMsg='';
+  let move=null, reason='', stats=null, failedMsg='', failedCategory=null;
 
   if(gameMode==='llm'){
     const res = await requestLLMMove();
     if(gid!==gameId || !isAITurn()){ aiThinking=false; return; }   // 期间已新开/换边：丢弃
-    if(!res.ok){ failedMsg = res.msg || '大模型 AI 走棋失败'; }
+    if(!res.ok){ failedMsg = res.msg || '大模型 AI 走棋失败'; failedCategory = res.category || null; }
     else { move=res.move; reason=res.reason; }
   }else{
     const side=currentTurn, level=aiLevel;
@@ -2817,8 +3101,15 @@ async function performAIMove(gid){
   if(!move){
     aiThinking=false;
     if(failedMsg){
-      llmInfoText = '大模型 AI 走棋失败：' + failedMsg;
-      showToast(failedMsg);
+      // 按错误类别给出更明确的提示与修改配置入口；绝不包含 Token
+      let tip = failedMsg;
+      if(failedCategory==='auth') tip += '（Token 无效或未授权，可点「模型配置」修改）';
+      else if(failedCategory==='forbidden') tip += '（访问被拒绝，可点「模型配置」修改）';
+      else if(failedCategory==='route') tip += '（接口路由不存在，可点「模型配置」检查 Base URL）';
+      else if(failedCategory==='rate_limit') tip += '（请求频率超限，稍后重试或点「模型配置」修改）';
+      else if(failedCategory==='config') tip += '（配置不合法，可点「模型配置」修改）';
+      llmInfoText = '大模型 AI 走棋失败：' + tip;
+      showToast(tip);
     }
     updateAiInfo();
     render();
@@ -2865,7 +3156,7 @@ function applySettings(){
   }
   if(gameMode!=='online') clearPeek();
   onlineRenderInfo();
-  if(gameMode==='llm') renderLLMInfo();
+  if(gameMode==='llm'){ renderConfigEntry(); renderLLMInfo(); }
   updateNewGameAttention();
 }
 
@@ -3219,7 +3510,37 @@ function onPieceClick(r,c){
   levelSel.value=pendingCfg.level;
 
   const onChange=()=>{
-    pendingCfg={ mode:modeSel.value, side:sideSel.value, level:levelSel.value };
+    const newMode = modeSel.value;
+    if(newMode==='llm'){
+      // 大模型 AI：优先使用本地配置；无配置则弹出配置窗口（取消则回退，不进入对局）
+      if(!llmConfig) llmConfig = loadLlmConfig();
+      const action = decideLlmModeSelection(cfgSaved());
+      const box=document.getElementById('settings');
+      if(action==='ready'){
+        pendingCfg={ mode:'llm', side:sideSel.value, level:levelSel.value };
+        if(box && box.classList){
+          box.classList.toggle('pve', false);
+          box.classList.toggle('llm', true);
+          box.classList.toggle('online-mode', false);
+        }
+        refreshLLMStatus();
+        renderConfigEntry();
+        if(hint) hint.textContent='已保存本地配置，点「新对局」开始对弈';
+        updateNewGameAttention();
+        return;
+      }
+      // 无本地配置：记录原模式，进入待配置状态并弹出窗口
+      llmPrevMode = pendingCfg.mode;
+      pendingCfg={ mode:'llm', side:sideSel.value, level:levelSel.value };
+      if(box && box.classList){
+        box.classList.toggle('pve', false);
+        box.classList.toggle('llm', true);
+        box.classList.toggle('online-mode', false);
+      }
+      openConfigModal();
+      return;
+    }
+    pendingCfg={ mode:newMode, side:sideSel.value, level:levelSel.value };
     const box=document.getElementById('settings');
     if(box && box.classList){
       box.classList.toggle('pve', pendingCfg.mode==='pve');
@@ -3231,13 +3552,6 @@ function onPieceClick(r,c){
       cancelAI();
       applySettings();
       if(hint) hint.textContent='创建或加入房间后即开始对局';
-      return;
-    }
-    if(pendingCfg.mode==='llm'){
-      // 大模型 AI 需要本地服务端：选到即探测服务端配置状态
-      refreshLLMStatus();
-      if(hint) hint.textContent='需启动服务端并配置 .env，点「新对局」生效';
-      updateNewGameAttention();
       return;
     }
     if(hint) hint.textContent='点「新对局」生效';

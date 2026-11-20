@@ -87,19 +87,113 @@ const engine = loadEngine();
 const DEFAULT_AI_TIMEOUT_MS = 30000;
 const DEFAULT_AI_MAX_ATTEMPTS = 3;
 
+// 规范化 OpenAI 兼容接口的基础地址：
+//  · 必须为 http/https；拒绝其它协议与明显无效地址
+//  · 去除尾部斜杠，并避免在已含 /chat/completions 的地址上重复拼接
+//  · 拒绝 URL 中内嵌的用户凭据（user:pass@），避免把凭据混入 baseUrl
+//  · 允许 127.0.0.1 / localhost，便于本地代理与自建网关
+// 返回规范化后的字符串；非法时返回 null。
+function normalizeBaseUrl(baseUrl) {
+  if (typeof baseUrl !== 'string' || baseUrl.trim() === '') return null;
+  let u = baseUrl.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(u)) return null;
+  let p;
+  try { p = new URL(u); } catch (e) { return null; }
+  if (!p.protocol || !p.protocol.toLowerCase().startsWith('http')) return null;
+  if (p.host === '') return null;
+  if (p.username || p.password) return null;   // 仅允许不含用户凭据的显式 baseUrl
+  u = u.replace(/\/chat\/completions$/i, '');
+  return u;
+}
+
+function validateAiConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return false;
+  if (!cfg.baseUrl || !normalizeBaseUrl(cfg.baseUrl)) return false;
+  const token = cfg.token != null ? cfg.token : cfg.apiToken;   // 兼容请求字段 apiToken 与内部字段 token
+  if (!token || typeof token !== 'string' || token.trim() === '') return false;
+  if (!cfg.model || typeof cfg.model !== 'string' || cfg.model.trim() === '') return false;
+  return true;
+}
+
 function aiConfig() {
+  // 统一配置：请求中的用户自定义 config > 服务端 .env 默认配置。
+  // 返回值统一含 baseUrl/token/model/timeoutMs/maxAttempts/source，便于后续复用。
+  const req = arguments.length >= 1 && arguments[0] ? arguments[0] : null;
+  if (req && typeof req.baseUrl === 'string' && typeof req.apiToken === 'string' && typeof req.model === 'string') {
+    const base = normalizeBaseUrl(req.baseUrl);
+    if (!base) return { error: 'invalid_config', msg: 'baseUrl 不合法' };
+    return {
+      baseUrl: base,
+      token: req.apiToken.trim(),
+      model: req.model.trim(),
+      timeoutMs: Number(process.env.AI_TIMEOUT_MS) > 0 ? Number(process.env.AI_TIMEOUT_MS) : DEFAULT_AI_TIMEOUT_MS,
+      maxAttempts: Number(process.env.AI_MAX_ATTEMPTS) > 0 ? Number(process.env.AI_MAX_ATTEMPTS) : DEFAULT_AI_MAX_ATTEMPTS,
+      source: 'user',
+    };
+  }
   const base = (process.env.AI_API_BASE || 'https://api.openai.com/v1').replace(/\/+$/, '');
   return {
-    base,
+    baseUrl: base,
     token: process.env.AI_API_TOKEN || '',
     model: process.env.AI_MODEL || '',
     timeoutMs: Number(process.env.AI_TIMEOUT_MS) > 0 ? Number(process.env.AI_TIMEOUT_MS) : DEFAULT_AI_TIMEOUT_MS,
     maxAttempts: Number(process.env.AI_MAX_ATTEMPTS) > 0 ? Number(process.env.AI_MAX_ATTEMPTS) : DEFAULT_AI_MAX_ATTEMPTS,
+    source: 'env',
   };
 }
+
 function aiConfigured() {
   const c = aiConfig();
-  return !!(c.token && c.model);
+  return !!(c.token && c.model && !c.error);
+}
+
+function resolveAiConfig(input) {
+  const req = input && input.config;
+  // 仅当用户提供的三项均为非空字符串时，才视为有效用户配置；否则回退 .env。
+  if (req && typeof req.baseUrl === 'string' && typeof req.apiToken === 'string' && typeof req.model === 'string') {
+    return aiConfig({ baseUrl: req.baseUrl, apiToken: req.apiToken, model: req.model });
+  }
+  return aiConfig();
+}
+
+// 把模型接口 HTTP 状态归类，便于前端区分错误类型（不暴露 Token）
+function classifyHttpStatus(status) {
+  if (status === 401) return 'auth';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'route';
+  if (status === 429) return 'rate_limit';
+  if (status >= 500) return 'server';
+  return 'model';
+}
+
+// 把文本中可能出现的 Token 替换为脱敏占位符，防止 Token 进入错误信息或日志
+function sanitizeToken(text, token) {
+  if (typeof text !== 'string' || !text) return text || '';
+  let out = text;
+  if (token && typeof token === 'string' && token.length >= 4) {
+    out = out.split(token).join('***');
+  }
+  // 兜底：去除形如 Authorization / Bearer / sk- 开头的敏感片段
+  out = out.replace(/Bearer\s+[^\s"',}]+/gi, 'Bearer ***');
+  out = out.replace(/(sk|ak|pk)-[A-Za-z0-9_-]{8,}/g, '***');
+  return out;
+}
+
+// 把模型接口错误归类为可区分类别，便于前端给出清晰提示，且不暴露 Token。
+// httpStatus 为模型接口返回的真实 HTTP 状态（未配置时为空），用于 401/403/404/429/5xx 分类。
+function classifyAiError(r, httpStatus) {
+  if (r && r.error === 'ai_not_configured') return { status: 400, error: 'ai_not_configured', category: 'config', message: r.msg || '服务端未配置大模型' };
+  if (r && r.error === 'invalid_config') return { status: 400, error: 'invalid_config', category: 'config', message: r.msg || '大模型配置不合法' };
+  if (r && r.error === 'bad_params') return { status: 400, error: 'bad_params', category: 'params', message: r.msg || '请求参数不合法' };
+  if (r && r.error === 'game_over') return { status: 400, error: 'game_over', category: 'game', message: r.msg || '对局已结束' };
+  if (r && r.error === 'no_moves') return { status: 400, error: 'no_moves', category: 'game', message: r.msg || '当前没有合法走法' };
+  if (httpStatus === 401) return { status: 401, error: 'auth_error', category: 'auth', message: '模型 API 鉴权失败（401）：Token 无效或未授权' };
+  if (httpStatus === 403) return { status: 403, error: 'forbidden_error', category: 'forbidden', message: '模型 API 访问被拒绝（403）' };
+  if (httpStatus === 404) return { status: 404, error: 'route_error', category: 'route', message: '模型接口路由不存在（404）' };
+  if (httpStatus === 429) return { status: 429, error: 'rate_limit_error', category: 'rate_limit', message: '模型 API 请求频率超限（429）' };
+  if (httpStatus && httpStatus >= 500) return { status: 500, error: 'server_error', category: 'server', message: '模型服务异常（HTTP ' + httpStatus + '）' };
+  // 模型调用失败（无明确 HTTP 状态或走法非法）：保留原始类别，不泄露 Token
+  return { status: 400, error: 'model_error', category: (r && r.category) || 'model', message: (r && r.msg) || '模型返回错误' };
 }
 
 // AI 专用引擎实例（与房间引擎隔离）
@@ -162,12 +256,12 @@ function movesToText(moves) {
 }
 
 // 调用 OpenAI 兼容的 /chat/completions，带超时
-async function callChatModel(messages, timeoutMs) {
-  const c = aiConfig();
+async function callChatModel(config, messages, timeoutMs) {
+  const c = config || aiConfig();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs || DEFAULT_AI_TIMEOUT_MS);
   try {
-    const res = await fetch(c.base + '/chat/completions', {
+    const res = await fetch(c.baseUrl + '/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -178,7 +272,12 @@ async function callChatModel(messages, timeoutMs) {
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => '');
-      throw new Error('模型接口返回 HTTP ' + res.status + (txt ? ('：' + txt.slice(0, 200)) : ''));
+      // 脱敏：错误正文可能被上游回显，避免把 Token 带入错误信息
+      const safeTxt = sanitizeToken(txt, c.token);
+      const err = new Error('模型接口返回 HTTP ' + res.status + (safeTxt ? ('：' + safeTxt.slice(0, 200)) : ''));
+      err.category = classifyHttpStatus(res.status);
+      err.httpStatus = res.status;
+      throw err;
     }
     const data = await res.json();
     const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
@@ -207,19 +306,29 @@ function normalizeAIMove(obj, legal) {
   return legal.find(m => m.fr === obj.from.r && m.fc === obj.from.c && m.tr === obj.to.r && m.tc === obj.to.c) || null;
 }
 
-// 核心：给定脱敏视图，让模型选一步并校验。返回 {ok,...} 或 {ok:false,error,msg}
+// 核心：给定脱敏视图，让模型选一步并校验。返回 {ok,...} 或 {ok:false,error,category,msg}
 async function aiMoveFromView(input) {
-  if (!aiConfigured()) {
-    return { ok: false, error: 'ai_not_configured', msg: '服务端未配置大模型（请在 .env 设置 AI_API_BASE / AI_API_TOKEN / AI_MODEL）' };
+  if (!input || !Array.isArray(input.board)) return { ok: false, error: 'bad_params', category: 'params', msg: '缺少棋盘数据' };
+  if (input.gameOver) return { ok: false, error: 'game_over', category: 'game', msg: '对局已结束' };
+
+  // 配置优先级：请求中用户 config > 服务端 .env。先解析，再按来源校验。
+  const userCfg = !!(input && input.config &&
+    typeof input.config.baseUrl === 'string' && input.config.baseUrl.trim() &&
+    typeof input.config.apiToken === 'string' && input.config.apiToken.trim() &&
+    typeof input.config.model === 'string' && input.config.model.trim());
+  const cfg = resolveAiConfig(input);
+  if (userCfg && !validateAiConfig(cfg)) {
+    return { ok: false, error: 'invalid_config', category: 'config', msg: '大模型配置不合法：baseUrl 需为合法地址，apiToken 与 model 必填' };
   }
-  if (!input || !Array.isArray(input.board)) return { ok: false, error: 'bad_params', msg: '缺少棋盘数据' };
-  if (input.gameOver) return { ok: false, error: 'game_over', msg: '对局已结束' };
+  if (!userCfg && !aiConfigured()) {
+    return { ok: false, error: 'ai_not_configured', category: 'config', msg: '服务端未配置大模型（请在 .env 设置 AI_API_BASE / AI_API_TOKEN / AI_MODEL，或在页面填写本地配置）' };
+  }
 
   engineAI.loadState(buildAIGameState(input));
-  if (engineAI.gameOver) return { ok: false, error: 'game_over', msg: '对局已结束' };
+  if (engineAI.gameOver) return { ok: false, error: 'game_over', category: 'game', msg: '对局已结束' };
   const turn = engineAI.turn;
   const legal = engineAI.collectMoves(turn);
-  if (!legal.length) return { ok: false, error: 'no_moves', msg: '当前没有合法走法' };
+  if (!legal.length) return { ok: false, error: 'no_moves', category: 'game', msg: '当前没有合法走法' };
 
   const historyText = (Array.isArray(input.moveLog) ? input.moveLog : []).slice(-20).join('\n');
   // 知识库：Core + 棋风策略 + 按棋局特征命中的 Skills 组合进 System Prompt。
@@ -239,14 +348,17 @@ async function aiMoveFromView(input) {
     ].filter(Boolean).join('\n') },
   ];
 
-  const cfg = aiConfig();
   let lastErr = '模型未返回可用走法';
+  let lastCategory = null;
+  let lastHttpStatus = null;
   for (let attempt = 1; attempt <= cfg.maxAttempts; attempt++) {
     let content;
     try {
-      content = await callChatModel(messages, cfg.timeoutMs);
+      content = await callChatModel(cfg, messages, cfg.timeoutMs);
     } catch (e) {
-      lastErr = '调用模型失败：' + ((e && e.message) || e);
+      lastErr = '调用模型失败：' + sanitizeToken(((e && e.message) || String(e)), cfg.token);
+      lastCategory = (e && e.category) || lastCategory;
+      lastHttpStatus = (e && e.httpStatus) || lastHttpStatus;
       continue;
     }
     const obj = parseModelJson(content);
@@ -268,7 +380,7 @@ async function aiMoveFromView(input) {
     messages.push({ role: 'assistant', content });
     messages.push({ role: 'user', content: '上一步返回的走法不合法。请严格从合法走法列表中重新选择一步，只返回 JSON。' });
   }
-  return { ok: false, error: 'ai_move_invalid', msg: lastErr };
+  return { ok: false, error: 'ai_move_invalid', category: lastCategory, httpStatus: lastHttpStatus, msg: lastErr };
 }
 
 // ---------- 房间 ----------
@@ -1338,19 +1450,36 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  // 大模型 AI：状态查询（只暴露是否已配置与模型名，绝不返回 Token）
+  // 大模型 AI：状态查询（只暴露是否已配置与默认模型名，绝不返回 Token）
   if (req.method === 'GET' && p === '/api/ai/status') {
-    const c = aiConfig();
-    return sendJSON(res, 200, { ok: true, configured: aiConfigured(), model: c.model || null });
+    const cfg = resolveAiConfig(null);
+    return sendJSON(res, 200, {
+      ok: true,
+      configured: aiConfigured(),
+      model: cfg.model || null,
+      baseUrl: cfg.baseUrl || null,
+      source: cfg.source || null,
+      endpoint: 'openai-compatible',
+    });
   }
   // 大模型 AI：根据脱敏视图选一步（服务端调用模型 API + 合法走法校验）
   if (req.method === 'POST' && p === '/api/ai/move') {
     let input;
     try { input = await readJsonBody(req, 64 * 1024); }
     catch (e) { return sendJSON(res, 400, { ok: false, error: 'bad_json', msg: '请求体不是合法 JSON' }); }
-    if (!input) return sendJSON(res, 400, { ok: false, error: 'bad_params', msg: '缺少请求体' });
+    if (!input) return sendJSON(res, 400, { ok: false, error: 'bad_params', category: 'params', message: '缺少请求体' });
+
     const r = await aiMoveFromView(input);
-    return sendJSON(res, r.ok ? 200 : 400, r);
+    if (r && r.ok) {
+      return sendJSON(res, 200, { ok: true, from: r.from, to: r.to, reason: r.reason || '' });
+    }
+    const category = classifyAiError(r, r && r.httpStatus);
+    return sendJSON(res, category.status, {
+      ok: false,
+      error: category.error,
+      category: category.category,
+      message: category.message,
+    });
   }
   // 大模型 AI：热重载本地知识库（修改知识文件后无需重启服务）
   if (req.method === 'POST' && p === '/api/ai/knowledge/reload') {
@@ -1555,4 +1684,5 @@ if (require.main === module) {
 }
 
 module.exports = { server, wss, start, stop, shutdown, loadEngine, createRoom, rooms, toView, playerCount, shouldReapRoom, initPersistence, storageInfo,
-  aiConfig, aiConfigured, sanitizeBoardForAI, aiMoveFromView, engineAI };
+  aiConfig, aiConfigured, sanitizeBoardForAI, aiMoveFromView, engineAI,
+  normalizeBaseUrl, validateAiConfig, resolveAiConfig, classifyAiError, classifyHttpStatus, callChatModel, sanitizeToken };
