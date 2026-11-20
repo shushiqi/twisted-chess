@@ -2660,6 +2660,14 @@ function cancelAI(){
 function scheduleAI(delay){
   cancelAI();
   if(!isAITurn()) return;
+  // 大模型 AI 必须有有效配置：无配置时不进入「AI 思考中」状态、不发起模型请求、不改变棋局
+  if(gameMode==='llm' && !getValidLlmConfig().ok){
+    aiThinking=false;
+    updateStatus();
+    updateAiInfo();
+    render();
+    return;
+  }
   aiThinking = true;
   const gid = gameId;
   updateStatus();
@@ -2899,6 +2907,13 @@ function saveConfigFromForm() {
   llmPrevMode = null;          // 保存成功：进入大模型 AI 模式，不再回退
   closeConfigModal();
   pendingCfg.mode = 'llm';
+  // 同步设置区样式，立即呈现「大模型 AI」面板与配置入口
+  const box = document.getElementById('settings');
+  if (box && box.classList) {
+    box.classList.toggle('pve', false);
+    box.classList.toggle('llm', true);
+    box.classList.toggle('online-mode', false);
+  }
   renderConfigEntry();
   refreshLLMStatus();
   renderLLMInfo();
@@ -2921,10 +2936,40 @@ function renderConfigStatus(msg) {
 
 function cfgSaved() { return !!(llmConfig && llmConfig.baseUrl && llmConfig.apiToken && llmConfig.model); }
 
-// 纯决策函数：大模型模式选择的动作，便于无浏览器环境测试选择流程。
-//  - saved=true  → 'ready'：已有有效配置，直接进入对局
-//  - saved=false → 'prompt'：无配置，需要弹出配置窗口
-function decideLlmModeSelection(saved) { return saved ? 'ready' : 'prompt'; }
+// 统一配置检查：优先本地 localStorage，其次服务端 .env 默认配置。
+// 返回 { ok, config, source, reason }：
+//   ok=true  → 具备可用配置；config 为本地配置对象（服务端 .env 时为 null，请求不携带 config）
+//   ok=false → 无任何可用配置，reason 为面向用户的提示文案
+// 说明：不重复实现校验，复用 loadLlmConfig 与既有必填判断；服务端 .env 是有效后备，
+//       仅当本地与服务端都无有效配置时才判定为未配置。
+function getValidLlmConfig() {
+  if (!llmConfig) llmConfig = loadLlmConfig();
+  // 1) 本地 localStorage 配置（字段完整且 Base URL 为合法 http/https）
+  if (llmConfig && llmConfig.baseUrl && llmConfig.apiToken && llmConfig.model &&
+      /^https?:\/\//i.test(String(llmConfig.baseUrl).trim())) {
+    return { ok: true, source: 'local', reason: '',
+      config: { baseUrl: String(llmConfig.baseUrl).trim(), apiToken: llmConfig.apiToken, model: llmConfig.model } };
+  }
+  // 2) 服务端 .env 默认配置作为有效后备（本地无配置时无需填写，请求不携带 config）
+  if (llmStatus && llmStatus.configured) {
+    return { ok: true, source: 'server', reason: '', config: null };
+  }
+  // 3) 本地与服务端均无有效配置
+  return { ok: false, source: 'none', reason: '尚未配置大模型 AI，请先完成 API 配置后再开始对战。', config: null };
+}
+
+// 大模型 AI 启动前置检查：无有效配置时阻止启动并提示（可选弹出配置窗口引导填写）。
+// 返回 true 表示配置有效、可以继续；false 表示已被拦截，调用方必须立即停止后续流程，
+// 不得切换模式、初始化棋盘、触发 AI 请求或改变任何棋局状态。
+function ensureLlmConfigReady(openModalIfMissing) {
+  const check = getValidLlmConfig();
+  if (check.ok) return true;
+  if (openModalIfMissing) openConfigModal();
+  llmInfoText = check.reason;
+  if (typeof showToast === 'function') showToast(check.reason);
+  updateAiInfo();
+  return false;
+}
 
 function escapeAttr(v) {
   if (v === null || v === undefined) return '';
@@ -3084,6 +3129,15 @@ async function performAIMove(gid){
   let move=null, reason='', stats=null, failedMsg='', failedCategory=null;
 
   if(gameMode==='llm'){
+    // 无有效配置时：不发起模型请求、不落子、不改变任何棋局状态
+    const check = getValidLlmConfig();
+    if(!check.ok){
+      aiThinking=false;
+      llmInfoText = check.reason;
+      if(typeof showToast==='function') showToast(check.reason);
+      updateAiInfo(); updateStatus(); render();
+      return;
+    }
     const res = await requestLLMMove();
     if(gid!==gameId || !isAITurn()){ aiThinking=false; return; }   // 期间已新开/换边：丢弃
     if(!res.ok){ failedMsg = res.msg || '大模型 AI 走棋失败'; failedCategory = res.category || null; }
@@ -3145,6 +3199,8 @@ function updateNewGameAttention(){
 }
 
 function applySettings(){
+  // 大模型 AI 必须有有效配置：无有效配置时禁止切换到大模型模式，避免在未配置时进入对局
+  if(pendingCfg.mode==='llm' && !getValidLlmConfig().ok) return;
   gameMode  = pendingCfg.mode;
   humanSide = pendingCfg.side;
   aiLevel   = pendingCfg.level;
@@ -3165,6 +3221,9 @@ function applySettings(){
 // 若按 gameMode 判断会走进联机分支并直接 return，导致"点新对局没反应"。
 function startNewGame(){
   const target = pendingCfg.mode;
+  // 大模型 AI 启动前置检查：无有效配置时立即停止整个启动流程，
+  // 不切换模式、不初始化棋盘、不触发 AI 请求、不改变回合/历史等任何棋局状态。
+  if(target==='llm' && !ensureLlmConfigReady(true)) return;
   if(target==='online'){
     // 联机：重置必须由服务端统一执行，本地不 setup
     if(gameMode!=='online') applySettings();      // 先把本地模式切到联机（面板/状态同步）
@@ -3512,11 +3571,12 @@ function onPieceClick(r,c){
   const onChange=()=>{
     const newMode = modeSel.value;
     if(newMode==='llm'){
-      // 大模型 AI：优先使用本地配置；无配置则弹出配置窗口（取消则回退，不进入对局）
+      // 大模型 AI：必须先有有效配置（本地 localStorage 或服务端 .env）才可进入对战。
+      // 无有效配置时立即停止启动流程：不切换模式、不触发 AI 请求、不改变棋局状态，仅弹出配置窗口引导。
       if(!llmConfig) llmConfig = loadLlmConfig();
-      const action = decideLlmModeSelection(cfgSaved());
+      const check = getValidLlmConfig();
       const box=document.getElementById('settings');
-      if(action==='ready'){
+      if(check.ok){
         pendingCfg={ mode:'llm', side:sideSel.value, level:levelSel.value };
         if(box && box.classList){
           box.classList.toggle('pve', false);
@@ -3525,18 +3585,15 @@ function onPieceClick(r,c){
         }
         refreshLLMStatus();
         renderConfigEntry();
-        if(hint) hint.textContent='已保存本地配置，点「新对局」开始对弈';
+        if(hint) hint.textContent = (check.source==='server')
+          ? '使用服务端默认配置，点「新对局」开始对弈'
+          : '已保存本地配置，点「新对局」开始对弈';
         updateNewGameAttention();
         return;
       }
-      // 无本地配置：记录原模式，进入待配置状态并弹出窗口
+      // 无有效配置：保持原模式不切换，明确提示并弹出配置窗口（取消则回退，不进入对局）
       llmPrevMode = pendingCfg.mode;
-      pendingCfg={ mode:'llm', side:sideSel.value, level:levelSel.value };
-      if(box && box.classList){
-        box.classList.toggle('pve', false);
-        box.classList.toggle('llm', true);
-        box.classList.toggle('online-mode', false);
-      }
+      if(hint) hint.textContent = check.reason || '尚未配置大模型 AI，请先完成 API 配置后再开始对战。';
       openConfigModal();
       return;
     }

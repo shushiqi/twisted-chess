@@ -216,7 +216,7 @@ test('/api/ai/move：模型 401 错误分类为 auth', async () => {
 
 // ---------- 前端：localStorage 配置读写逻辑 ----------
 // 从 jieqi.html 内联脚本中提取配置相关函数，用 mock localStorage 验证。
-function loadFrontendConfigFns() {
+function loadFrontendConfigFns(llmStatusArg) {
   const html = fs.readFileSync(path.join(__dirname, '..', 'jieqi.html'), 'utf8');
   const a = html.indexOf('<script>');
   const b = html.lastIndexOf('</script>');
@@ -231,10 +231,11 @@ function loadFrontendConfigFns() {
     setItem(k, v) { this._store[k] = String(v); },
     removeItem(k) { delete this._store[k]; },
   };
-  const fn = new Function('localStorage', 'document', snippet +
-    '; return { loadLlmConfig, saveLlmConfig, clearLlmConfig, cfgSaved, llmConfigKey, decideLlmModeSelection,' +
+  const fn = new Function('localStorage', 'document', 'llmStatus', snippet +
+    '; return { loadLlmConfig, saveLlmConfig, clearLlmConfig, cfgSaved, llmConfigKey, getValidLlmConfig,' +
     ' getLlmConfig(){return llmConfig;}, setLlmConfig(v){llmConfig=v;}, localStorage };');
-  return fn(localStorage, { getElementById: () => null });
+  const serverStatus = llmStatusArg || { configured: false, model: null, baseUrl: null, error: '' };
+  return fn(localStorage, { getElementById: () => null }, serverStatus);
 }
 
 test('前端 localStorage：首次无配置返回 null', () => {
@@ -275,18 +276,65 @@ test('前端 localStorage：清除后重新读取为 null', () => {
   assert.equal(f.loadLlmConfig(), null);
 });
 
-// ---------- 前端：大模型模式选择决策 ----------
-test('前端选择流程：无配置需弹窗，有配置直接进入', () => {
+// ---------- 前端：统一配置检查 getValidLlmConfig ----------
+// 覆盖验收场景：无配置 / 非法 JSON / 缺字段 / 完整配置 / 服务端 .env 兜底
+test('前端配置检查：无任何配置时判定无效并给出提示', () => {
+  const f = loadFrontendConfigFns();   // llmStatus.configured=false，localStorage 为空
+  const r = f.getValidLlmConfig();
+  assert.equal(r.ok, false);
+  assert.equal(r.source, 'none');
+  assert.ok(r.reason && r.reason.includes('尚未配置大模型 AI'), '应给出未配置提示');
+});
+
+test('前端配置检查：localStorage 非法 JSON 时判定无效', () => {
   const f = loadFrontendConfigFns();
-  // 首次无配置 → prompt（弹出配置窗口）
-  assert.equal(f.decideLlmModeSelection(f.cfgSaved()), 'prompt');
-  // 保存配置并同步内存（与浏览器 saveConfigFromForm 行为一致）→ ready（直接进入对局）
+  f.localStorage.setItem(f.llmConfigKey(), '{broken json');
+  assert.equal(f.getValidLlmConfig().ok, false);
+});
+
+test('前端配置检查：必要字段缺失时判定无效', () => {
+  const f = loadFrontendConfigFns();
+  // 只有 Base URL，缺 Token/Model
+  f.localStorage.setItem(f.llmConfigKey(), JSON.stringify({ baseUrl:'https://a.com/v1' }));
+  assert.equal(f.getValidLlmConfig().ok, false);
+  // 缺 Model
+  f.localStorage.setItem(f.llmConfigKey(), JSON.stringify({ baseUrl:'https://a.com/v1', apiToken:'t' }));
+  assert.equal(f.getValidLlmConfig().ok, false);
+  // Base URL 非 http/https
+  f.localStorage.setItem(f.llmConfigKey(), JSON.stringify({ baseUrl:'not-a-url', apiToken:'t', model:'m' }));
+  assert.equal(f.getValidLlmConfig().ok, false);
+});
+
+test('前端配置检查：本地配置完整时判定有效（source=local）', () => {
+  const f = loadFrontendConfigFns();
   f.saveLlmConfig({ baseUrl:'https://a.com/v1', apiToken:'t', model:'m' });
   f.setLlmConfig({ baseUrl:'https://a.com/v1', apiToken:'t', model:'m' });
-  assert.equal(f.decideLlmModeSelection(f.cfgSaved()), 'ready');
-  // 清除配置后 → 重新需要弹窗
+  const r = f.getValidLlmConfig();
+  assert.equal(r.ok, true);
+  assert.equal(r.source, 'local');
+  assert.equal(r.config.baseUrl, 'https://a.com/v1');
+  assert.equal(r.config.model, 'm');
+  // 清除后重新判定无效
   f.clearLlmConfig();
-  assert.equal(f.decideLlmModeSelection(f.cfgSaved()), 'prompt');
+  assert.equal(f.getValidLlmConfig().ok, false);
+});
+
+test('前端配置检查：无本地配置但服务端 .env 已配置时判定有效（source=server）', () => {
+  const f = loadFrontendConfigFns({ configured:true, model:'env-model', baseUrl:'https://env.example.com/v1' });
+  const r = f.getValidLlmConfig();
+  assert.equal(r.ok, true);
+  assert.equal(r.source, 'server');
+  assert.equal(r.config, null);   // 服务端兜底时请求不携带本地 config
+});
+
+test('前端配置检查：本地配置优先于服务端 .env', () => {
+  const f = loadFrontendConfigFns({ configured:true, model:'env-model', baseUrl:'https://env.example.com/v1' });
+  f.saveLlmConfig({ baseUrl:'https://local.example.com/v2', apiToken:'local-t', model:'local-m' });
+  f.setLlmConfig({ baseUrl:'https://local.example.com/v2', apiToken:'local-t', model:'local-m' });
+  const r = f.getValidLlmConfig();
+  assert.equal(r.ok, true);
+  assert.equal(r.source, 'local');
+  assert.equal(r.config.baseUrl, 'https://local.example.com/v2');
 });
 
 // ---------- 服务端：Token 脱敏 ----------
